@@ -1,0 +1,178 @@
+# Скрипт для отключения пользователей с простоем более 120 минут
+# Windows Server 2022 (Русская версия)
+
+# Параметры
+$MaxIdleMinutes = 120
+$LogFile = "C:\Logs\IdleSessionKicker.log"
+
+# Создание папки для логов если не существует
+$LogDir = Split-Path $LogFile -Parent
+if (!(Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+
+# Функция логирования
+function Write-Log {
+    param([string]$Message)
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogMessage = "$Timestamp - $Message"
+    Add-Content -Path $LogFile -Value $LogMessage
+    Write-Host $LogMessage
+}
+
+Write-Log "=== Запуск проверки неактивных сессий ==="
+Write-Log "Лимит простоя: $MaxIdleMinutes минут"
+
+try {
+    # Получение информации о сессиях через WMI
+    $Sessions = Get-CimInstance -ClassName Win32_LogonSession | Where-Object {
+        $_.LogonType -eq 2 -or $_.LogonType -eq 10  # Interactive или RemoteInteractive
+    }
+    
+    $ProcessList = Get-CimInstance -ClassName Win32_Process
+    
+    foreach ($Session in $Sessions) {
+        $SessionId = $Session.LogonId
+        
+        # Получаем пользователя для этой сессии
+        $LogonUser = Get-CimInstance -ClassName Win32_LoggedOnUser | Where-Object {
+            $_.Dependent.LogonId -eq $SessionId
+        } | Select-Object -First 1
+        
+        if (!$LogonUser) { continue }
+        
+        $Username = $LogonUser.Antecedent.Name
+        $Domain = $LogonUser.Antecedent.Domain
+        
+        # Пропускаем системные учетки
+        if ($Username -in @("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "DWM-1", "DWM-2")) {
+            continue
+        }
+        
+        # Получаем процессы пользователя в этой сессии
+        $UserProcesses = $ProcessList | Where-Object {
+            try {
+                $Owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+                if ($Owner) {
+                    $Owner.User -eq $Username -and $Owner.Domain -eq $Domain
+                } else {
+                    $false
+                }
+            } catch {
+                $false
+            }
+        }
+        
+        if (!$UserProcesses) { continue }
+        
+        # Находим самый свежий процесс пользователя
+        $NewestProcess = $UserProcesses | Sort-Object CreationDate -Descending | Select-Object -First 1
+        $LastActivity = $NewestProcess.CreationDate
+        
+        if ($LastActivity) {
+            $IdleTime = (Get-Date) - $LastActivity
+            $IdleMinutes = [math]::Floor($IdleTime.TotalMinutes)
+            
+            Write-Log "Пользователь: $Domain\$Username | Простой: $IdleMinutes мин"
+            
+            if ($IdleMinutes -ge $MaxIdleMinutes) {
+                Write-Log "  ПРЕВЫШЕН ЛИМИТ! Отключаем пользователя..."
+                
+                # Получаем Session ID из quser для отключения
+                $QuserOutput = quser 2>$null
+                foreach ($Line in $QuserOutput) {
+                    if ($Line -match $Username) {
+                        # Извлекаем ID сессии
+                        if ($Line -match '\s+(\d+)\s+') {
+                            $QSessionId = $Matches[1]
+                            Write-Log "  ID сессии: $QSessionId"
+                            
+                            try {
+                                logoff $QSessionId /SERVER:localhost
+                                Write-Log "  УСПЕХ: Пользователь $Username отключен (ID: $QSessionId)"
+                            }
+                            catch {
+                                Write-Log "  ОШИБКА при logoff: $_"
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Write-Log "`n--- Альтернативная проверка через quser ---"
+    
+    # Дополнительная проверка через quser
+    $QuserRaw = quser 2>$null
+    
+    if ($QuserRaw) {
+        Write-Log "Вывод quser:"
+        $QuserRaw | ForEach-Object { Write-Log $_ }
+        
+        foreach ($Line in ($QuserRaw | Select-Object -Skip 1)) {
+            # Разбиваем строку по пробелам (2 и более)
+            $Parts = $Line -split '\s{2,}' | Where-Object { $_ -ne '' }
+            
+            Write-Log "`nРазбор строки: $Line"
+            Write-Log "Части: $($Parts -join ' | ')"
+            
+            if ($Parts.Count -lt 4) { continue }
+            
+            # Парсинг в зависимости от формата
+            $Username = $Parts[0].Trim()
+            
+            # Находим ID сессии и время простоя
+            $SessionId = $null
+            $IdleTime = $null
+            
+            foreach ($Part in $Parts) {
+                if ($Part -match '^\d+$' -and !$SessionId) {
+                    $SessionId = $Part.Trim()
+                }
+                # Ищем время простоя (формат: число, число:число, или число+число:число)
+                if ($Part -match '^\d+$|^\d+:\d+$|^\d+\+\d+:\d+$') {
+                    $IdleTime = $Part.Trim()
+                }
+            }
+            
+            Write-Log "  Пользователь: $Username | ID: $SessionId | Простой: $IdleTime"
+            
+            if (!$SessionId -or !$IdleTime) { continue }
+            if ($IdleTime -eq '.' -or $IdleTime -eq 'none') { continue }
+            
+            # Конвертируем время простоя в минуты
+            $IdleMinutes = 0
+            if ($IdleTime -match '^(\d+)$') {
+                $IdleMinutes = [int]$Matches[1]
+            }
+            elseif ($IdleTime -match '^(\d+):(\d+)$') {
+                $IdleMinutes = ([int]$Matches[1] * 60) + [int]$Matches[2]
+            }
+            elseif ($IdleTime -match '^(\d+)\+(\d+):(\d+)$') {
+                $IdleMinutes = ([int]$Matches[1] * 1440) + ([int]$Matches[2] * 60) + [int]$Matches[3]
+            }
+            
+            Write-Log "  Простой в минутах: $IdleMinutes"
+            
+            if ($IdleMinutes -ge $MaxIdleMinutes) {
+                Write-Log "  ДЕЙСТВИЕ: Отключаем $Username (ID: $SessionId)"
+                try {
+                    logoff $SessionId
+                    Write-Log "  УСПЕХ: Пользователь отключен"
+                }
+                catch {
+                    Write-Log "  ОШИБКА: $_"
+                }
+            }
+        }
+    }
+}
+catch {
+    Write-Log "КРИТИЧЕСКАЯ ОШИБКА: $_"
+    Write-Log $_.ScriptStackTrace
+    exit 1
+}
+
+Write-Log "=== Проверка завершена ===`n"
