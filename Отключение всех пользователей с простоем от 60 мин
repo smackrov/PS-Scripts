@@ -1,0 +1,59 @@
+# Устанавливаем лимит простоя в минутах (необязательно, если нужно просто отключить всех отключенных пользователей)
+$idleLimit = 60
+
+# Получаем список всех активных сессий
+try {
+    $sessions = query session /server:$env:COMPUTERNAME 2>&1 | ? { $_ -notmatch "SESSIONNAME" -and $_ -notmatch "^\s*$" }
+} catch {
+    Write-Error "Ошибка при выполнении команды query session: $_"
+    exit
+}
+
+# Проходим по каждой сессии
+foreach ($session in $sessions) {
+    try {
+        # Разбираем строку сессии
+        $sessionInfo = $session -split "\s+"
+        
+        # Определяем индексы столбцов (зависит от локализации)
+        $sessionId = $sessionInfo[2]  # ID сессии
+        $userName = $sessionInfo[1]   # Имя пользователя
+        $state = $sessionInfo[3]      # Состояние сессии (например, "Диск", "Подключено")
+        $idleTime = $sessionInfo[4]   # Время простоя
+
+        # Преобразуем время простоя в минуты (если нужно)
+        $totalIdleMinutes = 0
+        if ($idleTime -match "(\d+)\+(\d+):(\d+)") {
+            # Формат "дни+часы:минуты"
+            $days = [int]$matches[1]
+            $hours = [int]$matches[2]
+            $minutes = [int]$matches[3]
+            $totalIdleMinutes = ($days * 1440) + ($hours * 60) + $minutes
+        } elseif ($idleTime -match "(\d+):(\d+)") {
+            # Формат "часы:минуты"
+            $hours = [int]$matches[1]
+            $minutes = [int]$matches[2]
+            $totalIdleMinutes = ($hours * 60) + $minutes
+        } elseif ($idleTime -match "(\d+)") {
+            # Формат "минуты"
+            $totalIdleMinutes = [int]$matches[1]
+        }
+
+        # Проверяем, что сессия в состоянии "Диск" (Disconnected)
+        if ($state -eq "Диск") {
+            Write-Host "Пользователь $userName (ID сессии: $sessionId) находится в состоянии 'Диск'. Выполняем logoff..."
+
+            # Выполняем logoff
+            try {
+                logoff $sessionId /server:$env:COMPUTERNAME
+                Write-Host "Пользователь $userName успешно отключен."
+            } catch {
+                Write-Warning "Ошибка при отключении пользователя $($userName): $_"
+            }
+        } else {
+            Write-Host "Пользователь $userName (ID сессии: $sessionId) находится в состоянии '$state'. Пропускаем."
+        }
+    } catch {
+        Write-Warning "Ошибка при обработке сессии: $_"
+    }
+}
